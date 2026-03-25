@@ -1,0 +1,4 @@
+docker build -t gte-reranker-server .
+
+docker run --gpus all -p 8000:8000 gte-reranker-server
+
