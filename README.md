@@ -238,3 +238,37 @@ gte-reranker-server/
 Interactive API docs are available at:
 - **Swagger UI**: `http://localhost:8000/docs`
 - **ReDoc**: `http://localhost:8000/redoc`
+
+## Set up Nvidia runtime 
+
+```bash
+# 1) kiểm tra host đã thấy GPU chưa
+nvidia-smi
+
+# 2) cài NVIDIA Container Toolkit (nếu chưa cài)
+apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates curl gnupg2
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+  gpg --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+apt-get update
+export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+apt-get install -y \
+  nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+  nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+  libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+  libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
+
+# 3) cấu hình Docker dùng NVIDIA runtime
+nvidia-ctk runtime configure --runtime=docker
+
+# 4) restart Docker
+systemctl restart docker
+# nếu máy không có systemd thì thử:
+# service docker restart
+```
