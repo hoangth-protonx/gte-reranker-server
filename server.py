@@ -64,11 +64,10 @@ def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: i
     model = AutoModelForSequenceClassification.from_pretrained(
         model_path,
         trust_remote_code=True,
-        dtype=torch.float16  # ✅ Fixed: `torch_dtype` is deprecated, use `dtype`
+        dtype=torch.float16
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     try:
         model = model.to(device)
     except Exception as e:
@@ -78,20 +77,43 @@ def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: i
 
     model.eval()
 
-    # ✅ Clamp max_length to the model's actual max position embeddings if available
+    # ✅ Read the actual RoPE table size — this is the hard ceiling for position_ids
+    safe_max_length = max_length
     try:
-        model_max_pos = model.config.max_position_embeddings
-        if max_length > model_max_pos:
-            print(f"⚠️ Clamping max_length from {max_length} to model's max_position_embeddings={model_max_pos}")
-            max_length = model_max_pos
+        # Walk common attribute paths for GTE/New architecture
+        for attr_path in [
+            "new.embeddings.rope",
+            "model.embeddings.rope",
+            "embeddings.rope",
+        ]:
+            obj = model
+            try:
+                for part in attr_path.split("."):
+                    obj = getattr(obj, part)
+                rope_table_size = obj.cos_cached.shape[0]
+                print(f"✅ Detected RoPE table size: {rope_table_size}")
+                safe_max_length = min(max_length, rope_table_size)
+                break
+            except AttributeError:
+                continue
+    except Exception as e:
+        print(f"⚠️ Could not auto-detect RoPE size: {e}")
+
+    # ✅ Also respect model config if available
+    try:
+        config_max = model.config.max_position_embeddings
+        safe_max_length = min(safe_max_length, config_max)
+        print(f"✅ config.max_position_embeddings: {config_max}")
     except AttributeError:
         pass
+
+    print(f"✅ Using max_length: {safe_max_length}")
 
     return {
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
-        "max_length": max_length
+        "max_length": safe_max_length
     }
 
 @asynccontextmanager
@@ -142,13 +164,12 @@ async def rerank(request: RerankRequest):
     model = _model_cache["model"]
     tokenizer = _model_cache["tokenizer"]
     device = _model_cache["device"]
+    safe_max = _model_cache["max_length"]
 
     if not request.documents:
         return RerankResponse(results=[], query=request.query)
 
-    # ✅ Respect the request's max_length but clamp it to the model's safe limit
-    effective_max_length = min(request.max_length, _model_cache["max_length"])
-
+    effective_max_length = min(request.max_length, safe_max)
     sentence_pairs = [[request.query, doc] for doc in request.documents]
 
     with torch.no_grad():
@@ -157,24 +178,24 @@ async def rerank(request: RerankRequest):
             padding=True,
             truncation=True,
             return_tensors="pt",
-            max_length=effective_max_length  # ✅ Use effective (clamped) length
+            max_length=effective_max_length
         )
-
         inputs.pop("token_type_ids", None)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # ✅ Validate position_ids won't exceed RoPE table before calling model
-        seq_len = inputs["input_ids"].shape[1]
-        if seq_len > _model_cache["max_length"]:
+        # ✅ Guard: catch token overflow BEFORE it reaches CUDA
+        actual_seq_len = inputs["input_ids"].shape[1]
+        if actual_seq_len > safe_max:
             raise HTTPException(
                 status_code=400,
-                detail=f"Tokenized sequence length {seq_len} exceeds model max {_model_cache['max_length']}"
+                detail=f"Sequence length after tokenization ({actual_seq_len}) "
+                       f"exceeds model RoPE limit ({safe_max}). "
+                       f"Reduce input size or max_length."
             )
 
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         scores = model(**inputs, return_dict=True).logits.view(-1).float()
+        scores = scores.cpu().tolist()
 
-        if torch.is_tensor(scores):
-            scores = scores.cpu().tolist()
 
     # Build results with original indices
     results_with_scores = []
@@ -204,4 +225,18 @@ async def rerank(request: RerankRequest):
 
     return RerankResponse(results=rerank_results, query=request.query)
 
+
+@app.get("/debug/rope", tags=["Debug"])
+async def debug_rope():
+    model = _model_cache["model"]
+    info = {"safe_max_length": _model_cache["max_length"]}
+    for path in ["new.embeddings.rope", "model.embeddings.rope", "embeddings.rope"]:
+        try:
+            obj = model
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            info[path] = list(obj.cos_cached.shape)
+        except AttributeError:
+            info[path] = "not found"
+    return info
 
