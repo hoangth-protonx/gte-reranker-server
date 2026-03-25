@@ -160,7 +160,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000 --workers 4
 ### Example: Rerank Documents
 https://dilan-aedilitian-subadditively.ngrok-free.dev/
 ```bash
-curl -X POST "http://136.59.129.136:8000/rerank" \
+curl -X POST "http://69.157.137.231:49032/rerank" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "machine learning tutorial",

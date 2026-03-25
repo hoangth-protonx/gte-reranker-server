@@ -1,12 +1,3 @@
-"""
-FastAPI server for serving the GTE multilingual reranker model.
-
-This server provides endpoints for:
-- Reranking search results based on query relevance
-- Health checks and model info
-"""
-
-# server.py
 import os
 os.environ["TRUST_REMOTE_CODE"] = "true"
 
@@ -18,7 +9,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import signal
 if not hasattr(signal, "SIGALRM"):
@@ -28,7 +20,7 @@ if not hasattr(signal, "alarm"):
 
 # --- Configuration ---
 DEFAULT_MODEL_PATH = Path("./reranker_model")
-DEFAULT_MAX_LENGTH = 1024
+DEFAULT_MAX_LENGTH = 8192
 
 
 # --- Pydantic Models ---
@@ -36,8 +28,8 @@ class RerankRequest(BaseModel):
     """Request model for reranking endpoint."""
     query: str = Field(..., description="The search query string")
     documents: List[str] = Field(..., description="List of document texts to rerank")
-    max_length: int = Field(default=128, description="Maximum sequence length for tokenization")
-    top_k: Optional[int] = Field(default=None, description="Return only top K results")
+    max_length: int = Field(default=8192, description="Maximum sequence length for tokenization")
+    top_k: Optional[int] = Field(default=20, description="Return only top K results")
     use_title: bool = Field(default=False, description="If True, treat documents as titles")
 
 
@@ -67,30 +59,40 @@ _model_cache: Dict[str, Any] = {}
 
 
 def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: int = DEFAULT_MAX_LENGTH):
-    """Load the reranker model and tokenizer."""
-    print(f"DEBUG: Loading reranker model from {model_path}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
     model = AutoModelForSequenceClassification.from_pretrained(
         model_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16
+        dtype=torch.float16  # ✅ Fixed: `torch_dtype` is deprecated, use `dtype`
     )
-    
-    # Move to GPU if available
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
+
+    try:
+        model = model.to(device)
+    except Exception as e:
+        print("⚠️ CUDA failed, falling back to CPU:", e)
+        device = "cpu"
+        model = model.to(device)
+
     model.eval()
-    
-    print(f"DEBUG: Model loaded on device: {device}")
-    
+
+    # ✅ Clamp max_length to the model's actual max position embeddings if available
+    try:
+        model_max_pos = model.config.max_position_embeddings
+        if max_length > model_max_pos:
+            print(f"⚠️ Clamping max_length from {max_length} to model's max_position_embeddings={model_max_pos}")
+            max_length = model_max_pos
+    except AttributeError:
+        pass
+
     return {
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
         "max_length": max_length
     }
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -123,7 +125,7 @@ async def get_model_info():
     """Get information about the loaded model."""
     if not _model_cache:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
+
     return ModelInfoResponse(
         model_path=str(DEFAULT_MODEL_PATH),
         max_length=_model_cache["max_length"],
@@ -134,44 +136,46 @@ async def get_model_info():
 
 @app.post("/rerank", response_model=RerankResponse, tags=["Reranking"])
 async def rerank(request: RerankRequest):
-    """
-    Rerank a list of documents based on their relevance to a query.
-    
-    This endpoint takes a query and a list of documents, computes relevance scores
-    using the GTE multilingual reranker model, and returns the documents sorted
-    by relevance score in descending order.
-    """
     if not _model_cache:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
+
     model = _model_cache["model"]
     tokenizer = _model_cache["tokenizer"]
     device = _model_cache["device"]
-    
+
     if not request.documents:
         return RerankResponse(results=[], query=request.query)
-    
-    # Prepare sentence pairs
+
+    # ✅ Respect the request's max_length but clamp it to the model's safe limit
+    effective_max_length = min(request.max_length, _model_cache["max_length"])
+
     sentence_pairs = [[request.query, doc] for doc in request.documents]
-    
-    # Tokenize and compute scores
+
     with torch.no_grad():
         inputs = tokenizer(
             sentence_pairs,
             padding=True,
             truncation=True,
             return_tensors="pt",
-            max_length=request.max_length
+            max_length=effective_max_length  # ✅ Use effective (clamped) length
         )
-        
-        # Move inputs to device
+
+        inputs.pop("token_type_ids", None)
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        
+
+        # ✅ Validate position_ids won't exceed RoPE table before calling model
+        seq_len = inputs["input_ids"].shape[1]
+        if seq_len > _model_cache["max_length"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tokenized sequence length {seq_len} exceeds model max {_model_cache['max_length']}"
+            )
+
         scores = model(**inputs, return_dict=True).logits.view(-1).float()
-        
+
         if torch.is_tensor(scores):
             scores = scores.cpu().tolist()
-    
+
     # Build results with original indices
     results_with_scores = []
     for idx, (doc, score) in enumerate(zip(request.documents, scores)):
@@ -180,14 +184,14 @@ async def rerank(request: RerankRequest):
             "relevance_score": float(score),
             "index": idx
         })
-    
+
     # Sort by relevance score (descending)
     results_with_scores.sort(key=lambda x: x["relevance_score"], reverse=True)
-    
+
     # Limit to top_k if specified
     if request.top_k is not None:
         results_with_scores = results_with_scores[:request.top_k]
-    
+
     # Convert to Pydantic models
     rerank_results = [
         RerankResult(
@@ -197,10 +201,7 @@ async def rerank(request: RerankRequest):
         )
         for r in results_with_scores
     ]
-    
+
     return RerankResponse(results=rerank_results, query=request.query)
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=12345)
