@@ -59,36 +59,15 @@ _model_cache: Dict[str, Any] = {}
 
 
 def get_safe_max_length(model, requested_max: int) -> int:
-    """
-    Scan ALL named buffers and parameters to find the RoPE cos/sin cache,
-    then clamp requested_max to that table's actual size.
-    """
-    # 1. Try named_buffers (cos_cached is usually registered as a buffer)
+    # Exact path now confirmed from /debug/buffers
     for name, buf in model.named_buffers():
-        if "cos" in name.lower() or "sin" in name.lower():
+        if "cos_cached" in name:
             table_size = buf.shape[0]
-            print(f"✅ Found RoPE buffer '{name}' with shape {list(buf.shape)} → max_length clamped to {table_size}")
+            print(f"✅ RoPE cos_cached '{name}' shape={list(buf.shape)} → limit={table_size}")
             return min(requested_max, table_size)
 
-    # 2. Try walking modules for any positional/rope-related size attribute
-    for name, module in model.named_modules():
-        for attr in ["max_seq_len", "max_seq_len_cached", "max_position_embeddings"]:
-            if hasattr(module, attr):
-                val = getattr(module, attr)
-                if isinstance(val, int):
-                    print(f"✅ Found '{attr}={val}' on module '{name}'")
-                    return min(requested_max, val)
-
-    # 3. Fallback: trust model config
-    try:
-        cfg_val = model.config.max_position_embeddings
-        print(f"✅ Falling back to config.max_position_embeddings={cfg_val}")
-        return min(requested_max, cfg_val)
-    except AttributeError:
-        pass
-
-    print(f"⚠️ Could not detect RoPE limit, using conservative fallback=512")
-    return 512  # safe conservative fallback
+    print("⚠️ cos_cached not found, using fallback=512")
+    return 512
 
 
 def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: int = DEFAULT_MAX_LENGTH):
@@ -186,48 +165,41 @@ async def rerank(request: RerankRequest):
         )
         inputs.pop("token_type_ids", None)
 
-        # ✅ Guard: catch token overflow BEFORE it reaches CUDA
         actual_seq_len = inputs["input_ids"].shape[1]
+        print(f"[rerank] docs={len(request.documents)} | requested_max={request.max_length} "
+              f"| effective_max={effective_max_length} | actual_seq_len={actual_seq_len} "
+              f"| safe_max={safe_max}")
+
+        # Hard block before it reaches CUDA
         if actual_seq_len > safe_max:
             raise HTTPException(
                 status_code=400,
-                detail=f"Sequence length after tokenization ({actual_seq_len}) "
-                       f"exceeds model RoPE limit ({safe_max}). "
-                       f"Reduce input size or max_length."
+                detail=f"Sequence length {actual_seq_len} exceeds RoPE table size {safe_max}"
             )
 
         inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # ✅ Explicitly pass position_ids so the model doesn't compute them wrong
+        batch_size = inputs["input_ids"].shape[0]
+        position_ids = torch.arange(actual_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        inputs["position_ids"] = position_ids
+
         scores = model(**inputs, return_dict=True).logits.view(-1).float()
         scores = scores.cpu().tolist()
 
-
-    # Build results with original indices
-    results_with_scores = []
-    for idx, (doc, score) in enumerate(zip(request.documents, scores)):
-        results_with_scores.append({
-            "document": doc,
-            "relevance_score": float(score),
-            "index": idx
-        })
-
-    # Sort by relevance score (descending)
+    results_with_scores = [
+        {"document": doc, "relevance_score": float(score), "index": idx}
+        for idx, (doc, score) in enumerate(zip(request.documents, scores))
+    ]
     results_with_scores.sort(key=lambda x: x["relevance_score"], reverse=True)
 
-    # Limit to top_k if specified
     if request.top_k is not None:
         results_with_scores = results_with_scores[:request.top_k]
 
-    # Convert to Pydantic models
-    rerank_results = [
-        RerankResult(
-            document=r["document"],
-            relevance_score=r["relevance_score"],
-            index=r["index"]
-        )
-        for r in results_with_scores
-    ]
-
-    return RerankResponse(results=rerank_results, query=request.query)
+    return RerankResponse(
+        results=[RerankResult(**r) for r in results_with_scores],
+        query=request.query
+    )
 
 
 @app.get("/debug/rope", tags=["Debug"])

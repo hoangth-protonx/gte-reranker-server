@@ -16,4 +16,5 @@ curl -X POST "http://69.157.137.231:49032/rerank" \
   }'
 
 
-  curl -X GET "http://69.157.137.231:49032/debug/rope"
+curl -X GET "http://69.157.137.231:49032/debug/rope"
+curl -X GET "http://69.157.137.231:49032/debug/buffers"
