@@ -2,3 +2,18 @@ docker build -t gte-reranker-server .
 
 docker run --gpus all -p 12345:12345 gte-reranker-server
 
+curl -X POST "http://69.157.137.231:49032/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "machine learning tutorial",
+    "documents": [
+      "Introduction to Python programming",
+      "Deep learning with neural networks",
+      "Basic statistics for data science",
+      "Advanced machine learning algorithms"
+    ],
+    "top_k": 2
+  }'
+
+
+  curl -X GET "http://69.157.137.231:49032/debug/rope"

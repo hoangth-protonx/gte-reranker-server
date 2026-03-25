@@ -58,6 +58,39 @@ class ModelInfoResponse(BaseModel):
 _model_cache: Dict[str, Any] = {}
 
 
+def get_safe_max_length(model, requested_max: int) -> int:
+    """
+    Scan ALL named buffers and parameters to find the RoPE cos/sin cache,
+    then clamp requested_max to that table's actual size.
+    """
+    # 1. Try named_buffers (cos_cached is usually registered as a buffer)
+    for name, buf in model.named_buffers():
+        if "cos" in name.lower() or "sin" in name.lower():
+            table_size = buf.shape[0]
+            print(f"✅ Found RoPE buffer '{name}' with shape {list(buf.shape)} → max_length clamped to {table_size}")
+            return min(requested_max, table_size)
+
+    # 2. Try walking modules for any positional/rope-related size attribute
+    for name, module in model.named_modules():
+        for attr in ["max_seq_len", "max_seq_len_cached", "max_position_embeddings"]:
+            if hasattr(module, attr):
+                val = getattr(module, attr)
+                if isinstance(val, int):
+                    print(f"✅ Found '{attr}={val}' on module '{name}'")
+                    return min(requested_max, val)
+
+    # 3. Fallback: trust model config
+    try:
+        cfg_val = model.config.max_position_embeddings
+        print(f"✅ Falling back to config.max_position_embeddings={cfg_val}")
+        return min(requested_max, cfg_val)
+    except AttributeError:
+        pass
+
+    print(f"⚠️ Could not detect RoPE limit, using conservative fallback=512")
+    return 512  # safe conservative fallback
+
+
 def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: int = DEFAULT_MAX_LENGTH):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
@@ -77,43 +110,14 @@ def load_reranker_model(model_path: str = str(DEFAULT_MODEL_PATH), max_length: i
 
     model.eval()
 
-    # ✅ Read the actual RoPE table size — this is the hard ceiling for position_ids
-    safe_max_length = max_length
-    try:
-        # Walk common attribute paths for GTE/New architecture
-        for attr_path in [
-            "new.embeddings.rope",
-            "model.embeddings.rope",
-            "embeddings.rope",
-        ]:
-            obj = model
-            try:
-                for part in attr_path.split("."):
-                    obj = getattr(obj, part)
-                rope_table_size = obj.cos_cached.shape[0]
-                print(f"✅ Detected RoPE table size: {rope_table_size}")
-                safe_max_length = min(max_length, rope_table_size)
-                break
-            except AttributeError:
-                continue
-    except Exception as e:
-        print(f"⚠️ Could not auto-detect RoPE size: {e}")
-
-    # ✅ Also respect model config if available
-    try:
-        config_max = model.config.max_position_embeddings
-        safe_max_length = min(safe_max_length, config_max)
-        print(f"✅ config.max_position_embeddings: {config_max}")
-    except AttributeError:
-        pass
-
-    print(f"✅ Using max_length: {safe_max_length}")
+    safe_max = get_safe_max_length(model, max_length)
+    print(f"✅ Final safe_max_length = {safe_max}")
 
     return {
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
-        "max_length": safe_max_length
+        "max_length": safe_max
     }
 
 @asynccontextmanager
@@ -240,3 +244,25 @@ async def debug_rope():
             info[path] = "not found"
     return info
 
+@app.get("/debug/model-tree", tags=["Debug"])
+async def debug_model_tree():
+    model = _model_cache["model"]
+    # Find any module with 'rope' or 'cos' in its name/attributes
+    rope_modules = {}
+    for name, module in model.named_modules():
+        if "rope" in name.lower() or "rotary" in name.lower():
+            attrs = {}
+            for attr in ["cos_cached", "sin_cached", "max_seq_len", "max_position_embeddings"]:
+                if hasattr(module, attr):
+                    val = getattr(module, attr)
+                    attrs[attr] = list(val.shape) if hasattr(val, "shape") else val
+            rope_modules[name] = attrs
+    return rope_modules
+
+@app.get("/debug/buffers", tags=["Debug"])
+async def debug_buffers():
+    model = _model_cache["model"]
+    return {
+        name: list(buf.shape)
+        for name, buf in model.named_buffers()
+    }
