@@ -2,6 +2,16 @@
 
 A high-performance FastAPI server for serving the **Alibaba GTE Multilingual Reranker** model (`Alibaba-NLP/gte-multilingual-reranker-base`).
 
+## Deploy docker
+
+```bash
+  git clone  https://github.com/hoangth-protonx/gte-reranker-server.git
+
+  docker build -t gte-reranker-server .
+
+  docker run --gpus all -p 12345:12345 gte-reranker-server
+```
+
 ## Architecture Overview
 
 ```
@@ -94,32 +104,7 @@ Client Request
 └─────────────────────────────────────┘
 ```
 
-### 2. **Model Loading**
 
-The model is loaded once at startup using FastAPI's `lifespan` context manager:
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _model_cache
-    _model_cache = load_reranker_model()
-    yield
-    # Cleanup on shutdown
-```
-
-**Key features:**
-- **Single initialization**: Model loaded once, shared across all requests
-- **GPU acceleration**: Automatically uses CUDA if available
-- **Memory efficiency**: Uses `float16` precision for reduced memory footprint
-
-### 3. **Data Models** (Pydantic)
-
-```python
-RerankRequest       # Input: query + documents
-RerankResult        # Single result with score + original index
-RerankResponse      # Output: sorted results
-ModelInfoResponse   # Model metadata
-```
 
 ## Setup
 
